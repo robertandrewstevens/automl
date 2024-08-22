@@ -1,0 +1,165 @@
+---
+title: "H2O AutoML Classification Porto Seguro"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+### Start H2O
+
+Load the R libraries to run AutoML
+
+
+
+```{r}
+library(h2o)
+library(caret)
+library(ggplot2)
+library(dplyr)
+library(summarytools)
+library(knitr)
+
+h2o.init()
+```
+
+
+<!-- ```{r init, echo = TRUE} -->
+<!-- h2o.init() -->
+<!-- h2o::h2o.no_progress()  # Turn off progress bars for notebook readability -->
+<!-- ``` -->
+
+### Load Data
+
+For this AutoML binary classification demo, we use training and test data from the [Safe Driver Prediction](https://www.kaggle.com/code/leenvander/porto-seguro-s-safe-driver-prediction/input) dataset. The goal here is to predict whether or not a driver will be deemed a safe driver. In this demo we use h2o AutoML.
+
+```{r load_pp, echo = TRUE}
+# Use local data file or download from GitHub
+docker_data_path <- "/home/jonen10/HPC SIG/porto_seguro/train.csv"
+
+# Load data
+h2o.train <- read.csv(docker_data_path)
+```
+
+Convert categorical features/target to factors and create an 80/20 split of the dataset for train and test.
+
+```{r}
+# train.index <- createDataPartition(h2o.train$target, p = .8, list = FALSE)
+# train.dat <- h2o.train[ train.index,]
+# test.dat <- h2o.train[ -train.index,]
+# 
+# data.table::fwrite(train.dat, file = "porto_train.csv", row.names = FALSE)
+# data.table::fwrite(test.dat, file = "porto_test.csv", row.names = FALSE)
+```
+
+Analyze the dataset feature data types and factor levels
+
+```{r convert_data}
+
+train.dat <- data.table::fread(file = "/home/jonen10/HPC SIG/porto_seguro/porto_train.csv")
+test.dat <- data.table::fread(file = "/home/jonen10/HPC SIG/porto_seguro/porto_test.csv")
+
+cat.var <- names(train.dat)[grepl('_cat$', names(train.dat))]
+cat.var <- c(cat.var, "target")
+cat.var
+
+train.dat <- train.dat %>%
+  mutate_at(.vars = cat.var, .funs = as.factor)
+
+cat.var <- names(test.dat)[grepl('_cat$', names(test.dat))]
+cat.var <- c(cat.var, "target")
+cat.var
+
+test.dat <- test.dat %>%
+  mutate_at(.vars = cat.var, .funs = as.factor)
+
+str(train.dat)
+str(test.dat)
+```
+
+The `"id"` column is a unique identifier so we remove that from the set of our predictors. For the AutoML process, we will perform 5 fold cross-validation and train up to 20 models, with 2 stacked ensembles.
+
+```{r train}
+train.h2o <- as.h2o(train.dat)
+test.h2o <- as.h2o(test.dat)
+
+pre.var <- names(train.h2o[, which(!(names(train.h2o) %in% c("target","id")))])
+tar.var <- names(train.h2o["target"])
+
+aml <- h2o.automl(x = pre.var,
+                  y = tar.var,
+                  nfolds = 5,
+                  training_frame = train.h2o,
+                  max_models = 20,
+                  stopping_metric = "AUCPR",
+                  seed = 123)
+```
+
+Analyze the AutoML leaderboard.
+
+```{r leaderboard}
+# View the AutoML Leaderboard
+lb <- aml@leaderboard
+print(lb, n = nrow(lb))  # Print all rows instead of default (6 rows)
+```
+
+Comparing all models in the AutoML leaderboard
+
+_Modelers can retrieve global explanations of models in the AutoML leaderboard and generate the following:_
+
+* _Variable Importance Heatmap (compares all non-Stacked models)_
+* _Model Correlation Heatmap (compares all models)_
+* _Partial Dependence (PD) Multi Plots (compare all models)_
+
+```{r fig.height=8 }
+
+h2o.varimp_heatmap(aml, top_n = 10)
+
+h2o.model_correlation_heatmap(aml, newdata = test.h2o, top_n = 10)
+
+h2o.pd_multi_plot(aml, newdata = test.h2o, column = "ps_car_13")
+
+# exa <- h2o.explain(aml, newdata = test.h2o, top_n_features = 5)
+# h2o.shap_explain_row_plot(best.xgb, newdata = test.h2o, row_index = 1, top_n_features = 10)
+# best.xgb <- h2o.getModel("GBM_2_AutoML_20230530_151411")
+# h2o.explain_row(best.xgb, newdata = test.h2o, row_index = 1)
+# h2o.shap_summary_plot(best.xgb, newdata = test.h2o, sample_size = 10)
+# h2o.varimp(best.xgb)
+# exa$varimp
+```
+
+
+
+Explainability of a single model in the AutoML object
+
+_Modelers can retrieve global explanations of a single model in the AutoML leaderboard and generate the following:_
+
+* _Confusion Matrix (classification only)_
+* _Variable Importance_
+* _Partial Dependence (PD) Plots_
+* _Individual Conditional Expectation (ICE) Plots_
+
+```{r}
+
+model.id <- as.data.frame(lb[3,]$model_id)
+top.non.ensemble <- h2o.getModel(model.id$model_id)
+
+h2o.confusionMatrix(top.non.ensemble, newdata = test.h2o)
+
+h2o.varimp_plot(top.non.ensemble, num_of_features = 10)
+
+h2o.shap_explain_row_plot(top.non.ensemble, newdata = test.h2o, row_index = 1, top_n_features = 10)
+
+h2o.pd_plot(top.non.ensemble, newdata = test.h2o, column = "ps_car_13")
+
+h2o.ice_plot(top.non.ensemble, newdata = test.h2o, column = "ps_car_13")
+```
+
+Review single model performance against a holdout set
+
+```{r}
+h2o.performance(top.non.ensemble, newdata = test.h2o)
+```

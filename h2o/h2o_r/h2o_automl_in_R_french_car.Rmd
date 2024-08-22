@@ -1,0 +1,223 @@
+---
+title: "H2O AutoML Regression French Motor Claims"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+  knitr::opts_chunk$set(echo = TRUE)
+```    
+
+## Start H2O
+
+Load the R libraries to run AutoML
+
+
+```{r}    
+library(h2o)
+library(dplyr)
+library(knitr)
+library(data.table)
+
+h2o.init()
+h2o::h2o.no_progress()
+```
+
+## Import Training and Test Datasets
+
+Import the French cars benchmark dataset (originally from the `CASdatasets` package):
+  
+```{r load_datasets}
+# Use local data file or download from GitHub
+data.path <- "/home/jonen10/HPC SIG/french_car/"
+
+#Load data from zip
+train.df <- read.csv(unz(paste0(data.path, "freMTPL2freq_dataset_train.zip")
+                         , filename = "freMTPL2freq_dataset_train.csv"))
+test.df <- read.csv(unz(paste0(data.path, "freMTPL2freq_dataset_test.zip")
+                        , filename = "freMTPL2freq_dataset_test.csv"))
+
+#Convert R dataframe to H2O frames
+fre.train.h2o <- as.h2o(train.df)
+fre.test.h2o <- as.h2o(test.df)
+```
+
+## Analyze the dataset
+
+Review the H2O training data frame to determine data types and review cardinality for categorical features.
+
+```{r describe_train}
+DT::datatable(as.data.frame(h2o.describe(fre.train.h2o)), rownames = FALSE
+              , caption = "Summary of the French Motor Claims training dataset")
+```
+
+```{r inspect_cat_levels}
+
+cat.features <- as.vector(h2o.columns_by_type(fre.train.h2o, coltype = "categorical"))
+
+h2o.levels(fre.train.h2o[, cat.features])
+```
+
+`"VehBrand"`, `"VehGas"`, `"Area"`, and `"Region"` are categorical features in this dataset, while all other predictors are integers. `"IDpol"` appears to identify the unique policies in the dataset, so this feature will be excluded during model training. `VehBrand` and `Region` have higher cardinality and may be candidates for additional encoding. 
+
+## Run H2O AutoML
+
+This AutoML run will utilize mostly default settings, but the leaderboard sorting and stopping metrics will be switched to `MAE`. `"ClaimNb"` and `"IDpol"` will be removed as features because one represents the response and the other uniquely identifies the policy. In addition, the distribution will be modified to `Poisson` instead of the default `Gaussian` distribution due to the `ClaimNb` response feature representing counts. 
+
+AutoML provides users with the ability to specify the number of models to create or the amount of training time for the process to run. For these experiments, `max_runtime_secs` will be set to 3600 seconds (1 hour). 
+
+```{r automl_train_general}
+
+# Establish the list of dataset features that will be excluded as predictors. IDpol and the response ClaimNb will be removed as predictors.
+ignored_columns <- c("ClaimNb", "IDpol")
+
+# Generate the list of dataset features for modeling
+features <- setdiff(names(fre.train.h2o), ignored_columns)
+
+# Run an H2O AutoML process using general parameters. We will use MAE as a stopping metric since it is the evaluation metric we are interested in for this experiment.
+
+aml.poisson <- h2o.automl(x = features
+                          , y = "ClaimNb"
+                          , training_frame = fre.train.h2o
+                          , max_runtime_secs = 3600
+                          , distribution = "poisson"
+                          , stopping_metric = "MAE"
+                          , sort_metric = "MAE"
+                          , seed = 123)
+```
+
+### Leaderboard Results
+
+Examine the leaderboard to review which models built in the AutoML process have the best cross-validated `MAE` values. Additional evaluation metrics are also available for review.
+
+```{r leaderboard_general}
+lb <- h2o.get_leaderboard(object = aml.poisson, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb), rownames = FALSE
+              , caption = "AutoML General Leaderboard")
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_perf}
+
+h2o.performance(aml.poisson@leader, newdata = fre.test.h2o)
+
+```
+
+### Best Model Residual Analysis Plot
+
+```{r general_res, fig.height=8, fig.width=8}
+
+h2o.residual_analysis_plot(aml.poisson@leader, fre.test.h2o)
+
+```
+
+## Experiment with H2O AutoML Parameters
+
+Evaluate the experimental H2o AutoML parameters `exploitation_ratio` and `preprocessing` to see if performance metrics can be improved from default settings. The `exploitation_ratio` is a ratio dedicated to the `exploitation` phase. Essentially, some of the budgeted resources will be dedicated to fine-tuning the best XGBoost and GBM models found during exploration, instead of dedicating all time to exploring the hyperparameter space.
+
+For the `preprocessing` parameter, it is currently limited to minimal target encoding. For details on H2O's target encoding parameter, please reference [H2O.ai Github Repo](https://github.com/h2oai/h2o-3/issues/7862).
+
+```{r train_experiment}
+aml.exp <- h2o.automl(x = features
+                      , y = "ClaimNb"
+                      , training_frame = fre.train.h2o
+                      , exploitation_ratio = 0.1
+                      , max_runtime_secs = 3600
+                      , distribution = "poisson"
+                      , stopping_metric = "MAE"
+                      , sort_metric = "MAE"
+                      , preprocessing = "target_encoding"
+                      , seed = 123)
+```
+
+### Leaderboard Results
+
+```{r leader_experiment, results= "asis"}
+# View the AutoML Leaderboard
+lb.exp <- h2o.get_leaderboard(object = aml.exp, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb.exp), rownames = FALSE
+              , caption = "Leaderboard for AutoML Experimental Features")
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_exp}
+
+h2o.performance(aml.exp@leader, newdata = fre.test.h2o)
+
+```
+
+### Best Model Residual Analysis Plot
+
+```{r res_exp, fig.height=8, fig.width=8}
+
+h2o.residual_analysis_plot(aml.exp@leader, fre.test.h2o)
+
+```
+
+## Experiment with H2O Target Encoded Framework
+
+A available function of H2O is that a target encoded framework can be created and then applied to model training and test sets to handle categorical features. In this experiment, the target encoded framework will be applied and target encoding will address the higher cardinality of `"Region"` and `"VehBrand"`. H2O AutoML modeling will then be run against the updated target encoded training and test sets.
+
+```{r exp_automl}
+
+# Select the categorical columns that target encoding will be applied to
+encoded_columns <- c("Region", "VehBrand")
+ 
+# Generate the target encoding framework that will be applied to the training and test holdout set
+target_encoder <- h2o.targetencoder(training_frame = fre.train.h2o,
+                                    x = encoded_columns,
+                                    y = "ClaimNb",
+                                    keep_original_categorical_columns = FALSE,
+                                    blending = TRUE,
+                                    inflection_point = 5,
+                                    smoothing = 10,
+                                    seed = 123)
+ 
+# Apply the target encoding framework to the training and test sets
+fre.te.train <- h2o.transform(target_encoder, fre.train.h2o, as_training=TRUE)
+fre.te.test <- h2o.transform(target_encoder, fre.test.h2o, noise=0)
+ 
+# Create the list of predictors needed for model training
+fre.features.te <- setdiff(names(fre.te.train), c(ignored_columns, encoded_columns))
+ 
+# Run H2O AutoML using a low exploitation_ratio and the target encoded training set
+aml.te <- h2o.automl(x = fre.features.te
+                     , y = "ClaimNb"
+                     , training_frame = fre.te.train
+                     , exploitation_ratio = 0.1
+                     , max_runtime_secs = 3600
+                     , stopping_metric = "MAE"
+                     , sort_metric = "MAE"
+                     , distribution = "poisson"
+                     , seed = 123)
+```
+
+### Leaderboard Results
+
+```{r leaderboard_te}
+lb.te <- h2o.get_leaderboard(object = aml.te, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb.te), rownames = FALSE
+              , caption = "Leaderboard for AutoML Target Encoded Framework")
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_te}
+
+h2o.performance(aml.te@leader, newdata = fre.te.test)
+
+```
+
+### Best Model Residual Analysis Plot
+
+```{r res_te, fig.height=8, fig.width=8}
+
+h2o.residual_analysis_plot(aml.te@leader, fre.te.test)
+
+```

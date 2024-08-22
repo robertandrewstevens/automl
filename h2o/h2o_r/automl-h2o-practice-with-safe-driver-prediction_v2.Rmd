@@ -1,0 +1,356 @@
+---
+title: "Porto Seguros Safe Driver Prediction with Automl.h2o"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+https://www.kaggle.com/code/unfinishedgod/automl-h2o-practice-with-safe-driver-prediction
+
+owen
+
+2020-04-30 23:56:12
+
+1. About Automl h2o
+
+2. Reference
+
+3. Porto Seguro's Safe Driver Prediction
+
+4. Preparation
+
+5. Data Cleaning
+
+6. Visualization
+
+7. Modeling
+
+8. Review
+
+## 1. About Automl h2o
+
+Let's use AutoML h2o to analyze the Porto Seguro's Safe Driver Prediction kaggle. In this time I learned how to use the Automl h2o in R, and it was a topic that I chose while looking for how to use it. There is a lot to be lacking in using the automatic h2o, so I refer to a lot of sites, refer to a kaggle notebook, and write it down.
+
+## 2. Reference
+
+The following is a reference link in studying h2o automl and the source of the notebook that analyzed Porto Seguros Safe Driver Prediction using h2o automl in the Kaggle.
+
+- H2O AutoML
+    + H2O tutorials: h2o tutorials 
+        - http://docs.h2o.ai/h2o-tutorials/latest-stable/index.html
+
+- H2O AutoML & Kaggle
+    + Troy Walters: h2o AutoML 
+        - https://www.kaggle.com/captcalculator/h2o-automl
+    + Bhavesh Ghodasara: AutoML (h2o) Trial 
+        - https://www.kaggle.com/bhavesh09/automl-h2o-trial
+
+- Kaggle
+    + Heads or Tails: Steering Wheel of Fortune - Porto Seguro EDA 
+        - https://www.kaggle.com/headsortails/steering-wheel-of-fortune-porto-seguro-eda
+    + Troy Walters: A Very Extensive Porto Exploratory Analysis 
+        - https://www.kaggle.com/captcalculator/a-very-extensive-porto-exploratory-analysis
+        
+## 3. Porto Seguro's Safe Driver Prediction
+
+Now lets get down to Porto Seguros Safe Driver Prediction. The goal is to predict whether drivers will claim insurance next year through data.
+
+https://www.kaggle.com/competitions/porto-seguro-safe-driver-prediction
+
+### 3.1 Evaluation
+
+The competition will be evaluated as a Normalized Gini Coefficant. First, to understand Gini Coeffient, it its as follows.
+
+In economics, the Gini coefficient, sometimes called the Gini index or Gini ratio, is a measure of statistical dispersion intended to represent the income or wealth distribution of a nations residents, and is the most commonly used measurement of inequality. It was developed by the Italian statistician and sociologist Corrado Gini and published in his 1912 paper Variability and Mutability (Italian: Variabilità e mutabilità).
+
+Economics_Gini_coefficient.svg.png
+
+https://en.wikipedia.org/wiki/Gini_coefficient
+
+### 3.2 Data overview
+
+- Each column can be classified as follows:
+    + ind
+    + reg
+    + car
+    + calc
+
+- The format of the data can be determined by the column name as follows:
+    + `_bin`: Binary Features
+    + `_cat`: Categorical Features
+    + Etc: Continuous or Ordinal Features
+
+- Values of "-1" indicate that the feature was missing from the observation
+
+## 4. Preparation
+
+### 4.1 Packages & Data load
+
+tidyverse install: "ERROR: dependencies ‘rvest’, ‘xml2’ are not available for package ‘tidyverse’"
+
+```{r}
+library(readr)
+# library(tidyverse)
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(h2o)
+library(caret)
+library(corrplot)
+library(ggthemes)
+library(purrr)  # added
+```
+
+
+```{r}
+train_set <- read_csv("train.csv")
+test_set <- read_csv("test.csv")
+```
+
+### 4.2 H2O init
+
+First, connect h2o and R through the `h2oinit()` function.
+
+```{r}
+h2o.init()
+```
+
+### 4.3 Data structure
+
+#### 4.3.1 Data structure
+
+```{r}
+str(train_set)
+```
+
+#### 4.3.2 Data summary
+
+```{r}
+summary(train_set)
+```
+
+## 5 Data Cleaning
+
+Lets do a data cleanging. As mentioned, the data in "-1" is missing value, so lets change it to NA. And the `_cat` column allows you to change it to a factor format.
+
+```{r}
+train_set[train_set == -1] <- NA
+test_set[test_set == -1] <- NA
+```
+
+```{r}
+summary(train_set)
+```
+
+```{r}
+cat_vars <- names(train_set)[grepl('_cat$', names(train_set))]
+cat_vars
+```
+
+```{r}
+# Added code due to H2O message and rearranged applying "mutate_at" to "train_set"
+# "If you wish to train a binary model instead of a regression model, 
+# convert your target column to categorical before training."
+
+# train_set <- train_set %>%
+#   mutate_at(.vars = cat_vars, .funs = as.factor)
+
+test_set <- test_set %>%
+  mutate_at(.vars = cat_vars, .funs = as.factor)
+```
+
+```{r}
+# Added
+cat_vars <- c(cat_vars, "target")
+cat_vars
+```
+
+```{r}
+train_set <- train_set %>%
+  mutate_at(.vars = cat_vars, .funs = as.factor)
+
+# test_set <- test_set %>%
+#   mutate_at(.vars = cat_vars, .funs = as.factor)
+```
+
+```{r}
+str(train_set)
+```
+
+## 6 Visualization
+
+### 6.1 Target visualiztion
+
+Let's look at the target variable.
+
+```{r}
+ggplot(data = train_set, aes(x = as.factor(target))) +
+    geom_bar(fill = "#D9230F") +
+    labs(
+      title = 'Distribution of Target Class',
+      x = "Target", 
+      y = "Target Count"
+    )
+```
+
+### 6.2 Missing value
+
+#### 6.2.1 Missing value visualiztion
+
+Let's look at the missing value ratio. Only a few of the 59 columns have significant missing values.
+
+```{r, fig.width=8, fig.height=8}
+data.frame(
+  feature = names(train_set), 
+  per_miss = map_dbl(train_set, function(x) { sum(is.na(x)) / length(x) })
+) %>%
+  ggplot(aes(x = reorder(feature, per_miss), y = per_miss)) + 
+    geom_bar(stat = 'identity', color = 'white', fill = '#D9230F') +
+    # theme(axis.text.x = element_text(angle = 90, hjust = 1)) + 
+    coord_flip() +
+    labs(x = '', y = 'Missing value ratio(%)', title = 'Missing Value by Feature') + 
+    scale_y_continuous(labels = scales::percent)
+```
+
+#### 6.2.2 Missing value table
+
+Let's take a closer look at the missing values of each column at the table. If you select only the top 10 and check it, it is as follows.
+
+```{r}
+missing_df <- data.frame(
+  feature = names(train_set), 
+  per_miss = round(map_dbl(train_set, function(x) { sum(is.na(x)) / length(x) }) * 100, 2)
+) %>% 
+  arrange(desc(per_miss)) %>% 
+  head(10)
+
+rownames(missing_df) <- NULL
+
+missing_df
+```
+
+### 6.3 Correlation overview
+
+#### 6.3.1 Correlation visualization
+
+Let's draw a plot of the correlation between each data. There is a large number of data, so it doesn't mean much to display as a table, so let's just take a quick look at the graph.
+
+```{r, fig.width=8, fig.height=8}
+train_set %>%
+  select(-starts_with("ps_calc"), -ps_ind_10_bin, -ps_ind_11_bin, -ps_car_10_cat, -id) %>%
+  mutate_at(vars(ends_with("cat")), funs(as.integer)) %>%
+  mutate_at(vars(ends_with("bin")), funs(as.integer)) %>%
+  mutate(target = as.integer(target)) %>%
+  cor(use="complete.obs", method = "spearman") %>%
+  corrplot(type="lower", tl.col = "black",  diag=FALSE)
+```
+
+## 7 Modeling
+
+### 7.1 Train / Valid
+
+Now that i have done the visualiztion, let's turn the model around. First, let's categorize the training data into Traing / Valid data and conduct the test. Later, we will proceed with the evaluation with the test data.
+
+In order to change the h2o model in progress, data should be adjusted to h2o through `as.h2o()` function.
+
+```{r}
+set.seed(32)
+
+index <- sample(1:nrow(train_set), nrow(train_set) * 0.7)
+
+tiny_train <- train_set[ index, ]
+train_val  <- train_set[-index, ]
+```
+
+```{r}
+dim(train_set)[1]
+```
+
+```{r}
+dim(tiny_train)[1]
+```
+
+```{r}
+dim(train_val)[1]
+```
+
+```{r}
+dim(tiny_train)[1] / dim(train_set)[1]
+```
+
+```{r}
+dim(train_val)[1] / dim(train_set)[1]
+```
+
+```{r}
+tiny_train.hex  <- as.h2o(tiny_train)
+```
+
+```{r}
+train_val.hex  <- as.h2o(train_val)
+```
+
+```{r}
+test.hex <- as.h2o(test_set)
+```
+
+```{r}
+# rm(train, tiny_train, train_val)
+# gc()
+
+target <- "target"
+predictors <- setdiff(names(tiny_train.hex), target)
+predictors  # should "id" be removed? Can't find info on it
+```
+
+### 7.2 Modeling
+
+Now, let's run the model using the `h2o.automl()` function, which is the core of this blog. For more information on `h2o.automl`, see:
+
+http://docs.h2o.ai/h2o-tutorials/latest-stable/index.html
+
+```{r}
+automl_h2o_models <- h2o.automl(
+  x = predictors,
+  y = target,
+  training_frame = tiny_train.hex,
+  leaderboard_frame = train_val.hex,
+  max_runtime_secs = 100
+)
+
+automl_h2o_models
+```
+
+```{r}
+automl_leader <- automl_h2o_models@leader
+automl_leader
+```
+
+```{r}
+# Predict on test set
+pred_conversion <- h2o.predict(object = automl_leader, newdata = test.hex)
+pred_conversion <- as.data.frame(pred_conversion)
+str(pred_conversion)
+```
+
+```{r}
+Submission <- cbind(test_set$id, pred_conversion)
+colnames(Submission) <- c("id", "target", "p0", "p1")   # added "p0", "p1"
+str(Submission)
+```
+
+```{r}
+write.csv(Submission, "Submission_AutoML.csv", row.names = FALSE)
+```
+
+## 8 Review
+
+Knowing `h2o.automl` gave a change to apply it in R.
+
+The process of researching what `h2o.automl` was difficult. It took quite a long time to figure out how h2o goes in R and automl goes.
+
+This is the challenge to me, how can we use these technologies? It was a matter of doing. At some point, I didn't like to study in a textbook style, but it feels like I'm studying 100 and writing about 10 in practice. So I thought about how I could use it in the actual. Kaggle. There was not much data in the Kaggle, and it took a long time to find the appropriate topic and classification data that looked like I could do with `ho2.automl()` right away.
+
+I've really tried something new. I didn't just listen to it somewhere, but I studied unfamiliar things from the beginning and prepared that, and now I'm going to pile up one by one.

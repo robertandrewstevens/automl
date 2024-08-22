@@ -1,0 +1,350 @@
+---
+title: "H2O AutoML Classification Porto Seguro"
+output:
+  html_document: default
+  html_notebook: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+  
+## Start H2O
+
+Load the R libraries to run AutoML
+
+
+
+```{r}
+library(h2o)
+library(dplyr)
+library(knitr)
+
+h2o.init()
+h2o::h2o.no_progress()
+```
+
+## Load Data
+
+For this AutoML binary classification demo, we use training data from the [Safe Driver Prediction](https://www.kaggle.com/competitions/porto-seguro-safe-driver-prediction/data?select=train.csv) dataset. The goal here is to predict whether an auto insurance policy holder will file a claim. This demo will be using h2o AutoML.
+
+Load the training and test datasets, convert features to categorical, and analyze the dataset feature data types and factor levels.
+
+```{r convert_data}
+train.dat <- data.table::fread(file = "/home/jonen10/HPC SIG/porto_seguro/porto_train.csv")
+test.dat <- data.table::fread(file = "/home/jonen10/HPC SIG/porto_seguro/porto_test.csv")
+
+train.dat[train.dat == -1] <- NA
+test.dat[test.dat == -1] <- NA
+
+cat.var <- names(train.dat)[grepl("_cat|_bin", names(train.dat))]
+cat.var <- c(cat.var, "target")
+
+train.dat <- train.dat %>%
+  mutate_at(.vars = cat.var, .funs = as.factor)
+
+cat.var <- names(test.dat)[grepl("_cat|_bin", names(test.dat))]
+cat.var <- c(cat.var, "target")
+
+test.dat <- test.dat %>%
+  mutate_at(.vars = cat.var, .funs = as.factor)
+
+train.h2o <- as.h2o(train.dat)
+test.h2o <- as.h2o(test.dat)
+```
+
+## Analyze the dataset
+
+Review the H2O training data frame to determine data types and review cardinality for categorical features.
+
+```{r describe_train}
+DT::datatable(as.data.frame(h2o.describe(train.h2o)), rownames = FALSE
+              , caption = "Summary of the Porto Seguro training dataset")
+```
+
+```{r inspect_cat_levels}
+
+cat.features <- as.vector(h2o.columns_by_type(train.h2o, coltype = "categorical"))
+
+h2o.levels(train.h2o[, cat.features])
+```
+
+The `"id"` column is a unique identifier and the `"fold"` column is used to stratify the dataset for cross-validation, so we remove them from our set of predictors. For the first AutoML process, we will perform 5 fold cross-validation and train models for up to 60 minutes using minimal parameter settings.
+
+## Run H2O AutoML (Primarily Default Settings)
+
+This AutoML run will utilize mostly default settings, but the leaderboard sorting and stopping metrics will be switched to `AUCPR`. `"target"`, `"id"`, and `"fold"` will be removed as predictors. AutoML provides users with the ability to specify the number of models to create or the amount of training time for the process to run. For these experiments, `max_runtime_secs` will be set to 3600 seconds (1 hour).
+
+AutoML performs a hyperparameter search for `GLM`, `XGBoost`, `GBM`, and `Deep Learning` algorithms in order to deliver the best models. You can find the list of possible hyperparameters and their potential values by reading through the `Random Grid Search Parameters` section of [H2o AutoML Documentation](https://docs.h2o.ai/h2o/latest-stable/h2o-docs/automl.html#random-grid-search-parameters). `Random Forest`, `Extremely Randomized Trees`, and `GLM` models are not grid searched. 
+
+```{r train_general}
+
+# Establish the list of dataset features that will be excluded as predictors. IDpol and the response ClaimNb will be removed as predictors.
+ignored_columns <- c("target", "id", "fold")
+
+# Generate the list of dataset features for modeling
+features <- setdiff(names(train.h2o), ignored_columns)
+
+aml <- h2o.automl(x = features
+                  , y = "target"
+                  , training_frame = train.h2o
+                  , fold_column = "fold"
+                  , max_runtime_secs = 3600
+                  , stopping_metric = "AUCPR"
+                  , sort_metric = "AUCPR"
+                  , seed = 123)
+```
+
+### Leaderboard Results
+
+Examine the leaderboard to review which models built in the AutoML process have the best cross-validated `AUCPR` values. Additional evaluation metrics are also available for review.
+
+```{r leader_general, results= "asis"}
+# View the AutoML Leaderboard
+
+lb <- h2o.get_leaderboard(object = aml, extra_columns = "ALL")
+DT::datatable(as.data.frame(lb), rownames = FALSE
+              , caption = "General AutoML Leaderboard")
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_perf}
+
+h2o.performance(aml@leader, newdata = test.h2o)
+
+```
+
+## Experiment with H2O AutoML Parameters
+
+Evaluate the experimental H2o AutoML parameters `exploitation_ratio` and `preprocessing` to see if performance metrics can be improved from default settings. The `exploitation_ratio` is a ratio dedicated to the `exploitation` phase. Essentially, some of the budgeted resources will be dedicated to fine-tuning the best XGBoost and GBM models found during exploration, instead of dedicating all time to exploring the hyperparameter space.
+
+For the `preprocessing` parameter, it is currently limited to minimal target encoding. For details on H2O's target encoding parameter, please reference [H2O.ai Github Repo](https://github.com/h2oai/h2o-3/issues/7862).
+
+```{r train_experiment}
+aml.exp <- h2o.automl(x = features
+                  , y = "target"
+                  , training_frame = train.h2o
+                  , exploitation_ratio = 0.1
+                  , fold_column = "fold"
+                  , max_runtime_secs = 3600
+                  , stopping_metric = "AUCPR"
+                  , sort_metric = "AUCPR"
+                  , preprocessing = "target_encoding"
+                  , seed = 123)
+```
+
+### Leaderboard Results
+
+```{r leader_experiment, results= "asis"}
+# View the AutoML Leaderboard
+lb <- h2o.get_leaderboard(object = aml.exp, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb), rownames = FALSE
+              , caption = "Leaderboard for AutoML Experimental Features")
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_exp}
+
+h2o.performance(aml.exp@leader, newdata = test.h2o)
+
+```
+
+## Experiment with balance classes in AutoML
+
+Because the dataset for this experiment is highly imbalanced, we will try the `balance_classes` parameter to see if performance can be improved.
+
+```{r train_balance}
+aml.bal <- h2o.automl(x = features
+                      , y = "target"
+                      , training_frame = train.h2o
+                      , fold_column = "fold"
+                      , balance_classes = TRUE
+                      , preprocessing = "target_encoding"
+                      , max_runtime_secs = 3600
+                      , stopping_metric = "AUCPR"
+                      , sort_metric = "AUCPR"
+                      , seed = 123)
+```
+
+### Leaderboard Results
+
+```{r leader_balance, results= "asis"}
+# View the AutoML Leaderboard
+
+lb <- h2o.get_leaderboard(object = aml.bal, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb), rownames = FALSE
+              , caption = "Leaderboard for AutoML using Balance Classes")
+
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_balance}
+
+h2o.performance(aml.bal@leader, newdata = test.h2o)
+
+```
+
+```{r train_te}
+
+# Specify categorical columns with high cardinality that you want to target encode
+encoded_columns <- c("ps_car_01_cat", "ps_car_04_cat", "ps_car_06_cat", "ps_car_11_cat")
+
+# Create a target encoded model framework  
+target_encoder <- h2o.targetencoder(training_frame = train.h2o
+                                    , x = encoded_columns
+                                    , y = "target"
+                                    , fold_column = "fold"
+                                    , data_leakage_handling = "KFold"
+                                    , keep_original_categorical_columns = FALSE
+                                    , blending = TRUE
+                                    , inflection_point = 5
+                                    , smoothing = 10
+                                    , seed = 123)
+  
+# New target encoded train and test sets
+ 
+transformed.train <- h2o.transform(target_encoder, train.h2o, as_training=TRUE)
+transformed.test <- h2o.transform(target_encoder, test.h2o, noise=0)
+
+# Create the list of predictors for the AutoML models  
+features.te <- setdiff(names(transformed.train), c(ignored_columns, encoded_columns))
+ 
+aml.te <- h2o.automl(x = features.te
+                      , y = "target"
+                      , training_frame = transformed.train
+                      , balance_classes = TRUE
+                      , exploitation_ratio = 0.1
+                      , fold_column = "fold"
+                      , max_runtime_secs = 3600
+                      , stopping_metric = "AUCPR"
+                      , sort_metric = "AUCPR"
+                      , seed = 123)
+```
+
+### Leaderboard Results
+
+```{r leader_te, results= "asis"}
+# View the AutoML Leaderboard
+
+lb <- h2o.get_leaderboard(object = aml.te, extra_columns = "ALL")
+
+DT::datatable(as.data.frame(lb), rownames = FALSE
+              , caption = "Leaderboard for AutoML using Target Encoded Framework")
+
+```
+
+### Best Model Performance (Holdout Set)
+
+```{r general_te}
+
+h2o.performance(aml.te@leader, newdata = transformed.test)
+
+```
+
+### AutoML Explainability
+
+Interpretations using `h2o.explain()` and `h2o.explain_row()` single function calls
+
+```{r explain_test, fig.height=8, fig.width=8}
+
+train.h2o <- train.h2o[, 2:60]
+
+# Generate the list of non-stacked ensemble models from the leaderboard
+no.ensemble.model <- as.vector(h2o.grep("Stacked|GLM|Deep", aml@leaderboard["model_id"], invert = TRUE))
+non.ensemble <- aml@leaderboard[no.ensemble.model, ]
+
+# Load the top non stacked-ensemble H2O AutoML model
+top.non.ensemble <- h2o.getModel(non.ensemble[1,"model_id"])
+
+# Generate global explanations for group of models. In this case, the top 20 of the leaderboard.
+exa <- h2o.explain(aml@leaderboard[1:15, ], newdata = test.h2o)
+
+# Generate variable importance heat map and model correlation heatmaps by calling H2OExplanation object
+exa$varimp_heatmap
+
+exa$model_correlation_heatmap
+
+# Generate global explanations for top non-ensemble. 
+exm <- h2o.explain(top.non.ensemble, newdata = test.h2o, plot_overrides = list(shap_summary_plot = list(sample_size = 10000)))
+
+# Generate variable importance and partial dependence plots by calling H2OExplanation object for top non-ensemble
+exm$varimp
+
+exm$pdp
+
+# Generate local explanations for leaderboard. In this case, the top tree-based model in AutoML will be chosen.
+exa.row <- h2o.explain_row(aml, newdata = test.h2o, row_index = 1)
+
+# Generate local interpretation for first row of test data.
+exa.row$shap_explain_row
+
+```
+
+### AutoML Explainability (Leaderboard Models)
+
+Interpreting a list of models in the AutoML leaderboard using individual plotting functions.
+
+_Modelers can retrieve global explanations of models in the AutoML leaderboard and generate the following:_
+
+* _Standardized Coefficient Magnitudes (stacked ensemble)_
+* _Variable Importance Heatmap (compares all non-Stacked models)_
+* _Model Correlation Heatmap (compares all models)_
+* _Partial Dependence (PD) Multi Plots (compare all models)_
+
+```{r interpet_leaderboard, fig.height=8, fig.width=8 }
+
+# Analyze the standardized coefficient magnitudes for stacked ensemble
+
+# Generate the list of stacked ensemble models from the leaderboard
+ensemble.model <- as.vector(h2o.grep("Stacked", aml@leaderboard["model_id"], invert = FALSE))
+ensemble <- aml@leaderboard[ensemble.model, ]
+
+# Load the top stacked-ensemble H2O AutoML model
+top.ensemble <- h2o.getModel(ensemble[1,"model_id"])
+
+# Plot the standardized coefficient magnitudes for the top ensemble model
+h2o.std_coef_plot(top.ensemble@model$metalearner_model, num_of_features = 10)
+
+# Generate variable importance heatmap for top 10 non-ensemble models
+h2o.varimp_heatmap(aml, top_n = 10)
+
+# View the correlation between the predictions of the top 10 selected models
+h2o.model_correlation_heatmap(aml, newdata = test.h2o, top_n = 10)
+
+# Partial dependency plot for AutoML leaderboard
+h2o.pd_multi_plot(aml, newdata = test.h2o, column = "ps_car_13")
+
+```
+
+### AutoML Explainability (Single Model)
+
+Interpret a single model in the AutoML object
+
+_Modelers can retrieve global explanations of a single model in the AutoML leaderboard and generate the following:_
+
+* _Confusion Matrix (classification only)_
+* _Variable Importance_
+* _Partial Dependence (PD) Plots_
+* _Individual Conditional Expectation (ICE) Plots_
+
+```{r interpret_model}
+# Generate a confusion matrix against the holdout set
+h2o.confusionMatrix(top.non.ensemble, newdata = test.h2o)
+
+# Plot variable importance of single model
+h2o.varimp_plot(top.non.ensemble, num_of_features = 10)
+
+# Show contributions of features for a given row
+h2o.shap_explain_row_plot(top.non.ensemble, newdata = train.h2o, row_index = 1, top_n_features = 2)
+
+# Sample 10000 rows and show contributions of features
+h2o.shap_summary_plot(top.non.ensemble, newdata = train.h2o, sample_size = 10000)
+
+# Generate a partial dependence plot
+h2o.pd_plot(top.non.ensemble, newdata = train.h2o, column = "ps_car_13")
+```
